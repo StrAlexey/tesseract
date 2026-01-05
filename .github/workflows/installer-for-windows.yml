@@ -1,6 +1,6 @@
 # GitHub actions - Create Tesseract installer for Windows
 
-name: Cross build for Windows
+name: Tesseract Installer for Windows
 
 on:
   # Trigger workflow in GitHub web frontend or from API.
