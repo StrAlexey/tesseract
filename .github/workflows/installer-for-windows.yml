@@ -207,19 +207,6 @@ jobs:
           Root: HKCU; Subkey: "Software\Tesseract-OCR"; ValueType: string; ValueName: "Path"; ValueData: "{app}"; Flags: uninsdeletekey
 
           [Code]
-          function SendMessageTimeout(hWnd: Longint; Msg: Longint; wParam: Longint; lParam: string;
-            fuFlags: Longint; uTimeout: Longint; var lpdwResult: Longint): Longint;
-            external 'SendMessageTimeoutW@user32.dll stdcall';
-
-          procedure BroadcastEnvironmentChange;
-          var
-            ResultCode: Longint;
-          begin
-            ResultCode := 0;
-            { HWND_BROADCAST=0xFFFF, WM_SETTINGCHANGE=0x001A, SMTO_ABORTIFHUNG=0x0002 }
-            SendMessageTimeout($FFFF, $001A, 0, 'Environment', $0002, 5000, ResultCode);
-          end;
-
           procedure EnvAddPathUser(const NewPath: string);
           var
             Paths: string;
@@ -233,7 +220,6 @@ jobs:
               Paths := NewPath;
 
             RegWriteStringValue(HKCU, 'Environment', 'Path', Paths);
-            BroadcastEnvironmentChange;
           end;
 
           procedure EnvRemovePathUser(const RemovePath: string);
@@ -260,7 +246,6 @@ jobs:
             end;
 
             RegWriteStringValue(HKCU, 'Environment', 'Path', NewPaths);
-            BroadcastEnvironmentChange;
           end;
 
           procedure CurStepChanged(CurStep: TSetupStep);
