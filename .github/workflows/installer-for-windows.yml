@@ -33,10 +33,21 @@ jobs:
           mkdir -p "$RUNTIME_DIR/tessdata"
 
           # Main executable
-          cp "$MINGW_INSTALL_DIR/bin/tesseract.exe" "$RUNTIME_DIR/"
+          echo "Searching for tesseract.exe..."
+          TESSERACT_EXE=$(find / -type f -name tesseract.exe 2>/dev/null | head -n 1)
+
+          if [ -z "$TESSERACT_EXE" ]; then
+            echo "tesseract.exe not found"
+            exit 1
+          fi
+
+          echo "Found: $TESSERACT_EXE"
+          cp "$TESSERACT_EXE" "$RUNTIME_DIR/"
 
           # DLLs
-          cp "$MINGW_INSTALL_DIR/bin/"*.dll "$RUNTIME_DIR/" || true
+          find / -type f -name "*.dll" -path "*mingw*" 2>/dev/null | while read f; do
+            cp -n "$f" "$RUNTIME_DIR/" || true
+          done
           if [ -d "${PWD}/dll" ]; then
             cp -Lv "${PWD}/dll/"*.dll "$RUNTIME_DIR/" || true
           fi
