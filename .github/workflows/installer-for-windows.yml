@@ -48,6 +48,12 @@ jobs:
             Write-Host "vcpkg already exists at $env:VCPKG_ROOT"
           }
 
+          # Ensure we really have a "classic-capable" vcpkg root
+          $marker = Join-Path $env:VCPKG_ROOT ".vcpkg-root"
+          if (!(Test-Path $marker)) {
+            throw "vcpkg root marker not found: $marker. The cloned vcpkg folder is not a valid classic vcpkg instance."
+          }
+
       - name: Bootstrap vcpkg
         shell: pwsh
         run: |
@@ -57,22 +63,20 @@ jobs:
         shell: pwsh
         run: |
           choco install -y cmake ninja innosetup
-          # MSVC toolchain is already available on windows-latest; ensure it is visible:
           & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
 
-      # IMPORTANT: ensure Ninja/CMake uses MSVC (cl.exe), not some random gcc/mingw on PATH
-      - name: Setup MSVC Dev Cmd
-        uses: ilammy/msvc-dev-cmd@v1
-
       # ----------------------------------------
-      # Install deps via vcpkg (no "SW" nonsense)
+      # Install deps via vcpkg
       # ----------------------------------------
       - name: Install Tesseract dependencies (vcpkg)
         shell: pwsh
+        working-directory: ${{ github.workspace }}
         run: |
-          # Minimal dependency set for Tesseract build on Windows:
-          # - leptonica is required; it will pull zlib/libpng/libjpeg/tiff/webp as needed
-          & "$env:VCPKG_ROOT\vcpkg.exe" install leptonica --triplet $env:VCPKG_DEFAULT_TRIPLET
+          # Force classic mode explicitly (fixes: "manifest not found" + "no classic mode instance")
+          & "$env:VCPKG_ROOT\vcpkg.exe" `
+            --vcpkg-root "$env:VCPKG_ROOT" `
+            --classic `
+            install "leptonica:$env:VCPKG_DEFAULT_TRIPLET"
 
       # -----------------------------
       # Configure & build Tesseract
@@ -114,7 +118,6 @@ jobs:
           New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
           New-Item -ItemType Directory -Force -Path $tessdata   | Out-Null
 
-          # Try to locate the built exe (Ninja usually places it in build dir root or bin/)
           $exeCandidates = @(
             (Join-Path $buildDir "tesseract.exe"),
             (Join-Path $buildDir "bin\tesseract.exe"),
@@ -132,15 +135,12 @@ jobs:
           Copy-Item $tesseractExe $runtimeDir -Force
           Write-Host "Using tesseract.exe: $tesseractExe"
 
-          # Copy runtime DLLs next to exe (broad but practical):
-          # - From build output
           Get-ChildItem -Path $buildDir -Recurse -Filter *.dll -File |
             Where-Object { $_.FullName -notmatch '\\CMakeFiles\\' } |
             ForEach-Object {
               Copy-Item $_.FullName $runtimeDir -Force -ErrorAction SilentlyContinue
             }
 
-          # - From vcpkg installed bin (needed DLLs for leptonica etc.)
           $vcpkgBin = Join-Path $env:VCPKG_ROOT "installed\$env:VCPKG_DEFAULT_TRIPLET\bin"
           if (Test-Path $vcpkgBin) {
             Get-ChildItem -Path $vcpkgBin -Filter *.dll -File |
@@ -149,14 +149,11 @@ jobs:
               }
           }
 
-          # Copy tessdata support folders if repo provides them (optional)
-          # (Keeping this optional; your offline requirement is only eng.traineddata)
           $repoTessdata = Join-Path $env:GITHUB_WORKSPACE "tessdata"
           if (Test-Path $repoTessdata) {
             Copy-Item (Join-Path $repoTessdata "*") $tessdata -Recurse -Force -ErrorAction SilentlyContinue
           }
 
-          # Copy YOUR offline traineddata (mandatory)
           Copy-Item (Join-Path $env:GITHUB_WORKSPACE "assets\tessdata\eng.traineddata") $tessdata -Force
 
           Write-Host "dist_runtime:"
@@ -197,7 +194,6 @@ jobs:
           DisableDirPage=yes
           DisableProgramGroupPage=yes
 
-          ; D:\ install usually doesn't require admin
           PrivilegesRequired=lowest
 
           OutputDir=output
@@ -211,35 +207,27 @@ jobs:
           Name: "english"; MessagesFile: "compiler:Default.isl"
 
           [Files]
-          ; Copy prepared runtime folder into {app}
           Source: "{#SourcePath}\..\dist_runtime\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
 
           [Registry]
-          ; Store install path (per-user)
           Root: HKCU; Subkey: "Software\Tesseract-OCR"; ValueType: string; ValueName: "Path"; ValueData: "{app}"; Flags: uninsdeletekey
 
           [Code]
-          procedure NotifyEnvChanged();
-          var
-            ResultCode: DWORD;
-          begin
-            SendMessageTimeout(HWND_BROADCAST, WM_SETTINGCHANGE, 0, 'Environment', SMTO_ABORTIFHUNG, 5000, ResultCode);
-          end;
-
           procedure EnvAddPathUser(const NewPath: string);
           var
             Paths: string;
+            ResultCode: DWORD;
           begin
             if RegQueryStringValue(HKCU, 'Environment', 'Path', Paths) then
             begin
-              if Pos(';' + LowerCase(NewPath) + ';', ';' + LowerCase(Paths) + ';') = 0 then
+              if Pos(LowerCase(NewPath), LowerCase(Paths)) = 0 then
                 Paths := Paths + ';' + NewPath;
             end
             else
               Paths := NewPath;
 
-            RegWriteExpandStringValue(HKCU, 'Environment', 'Path', Paths);
-            NotifyEnvChanged();
+            RegWriteStringValue(HKCU, 'Environment', 'Path', Paths);
+            SendMessageTimeout(HWND_BROADCAST, WM_SETTINGCHANGE, 0, 'Environment', SMTO_ABORTIFHUNG, 5000, ResultCode);
           end;
 
           procedure EnvRemovePathUser(const RemovePath: string);
@@ -247,6 +235,7 @@ jobs:
             Paths, NewPaths: string;
             Parts: TArrayOfString;
             I: Integer;
+            ResultCode: DWORD;
           begin
             if not RegQueryStringValue(HKCU, 'Environment', 'Path', Paths) then
               exit;
@@ -265,25 +254,20 @@ jobs:
               end;
             end;
 
-            RegWriteExpandStringValue(HKCU, 'Environment', 'Path', NewPaths);
-            NotifyEnvChanged();
+            RegWriteStringValue(HKCU, 'Environment', 'Path', NewPaths);
+            SendMessageTimeout(HWND_BROADCAST, WM_SETTINGCHANGE, 0, 'Environment', SMTO_ABORTIFHUNG, 5000, ResultCode);
           end;
 
           procedure CurStepChanged(CurStep: TSetupStep);
           begin
             if CurStep = ssPostInstall then
-            begin
-              ; Add install directory (contains tesseract.exe) to USER PATH
               EnvAddPathUser(ExpandConstant('{app}'));
-            end;
           end;
 
           procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
           begin
             if CurUninstallStep = usPostUninstall then
-            begin
               EnvRemovePathUser(ExpandConstant('{app}'));
-            end;
           end;
           "@ | Set-Content -Encoding UTF8 $issPath
 
