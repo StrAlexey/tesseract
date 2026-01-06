@@ -118,29 +118,29 @@ jobs:
           New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
           New-Item -ItemType Directory -Force -Path $tessdata   | Out-Null
 
-          $exeCandidates = @(
-            (Join-Path $buildDir "tesseract.exe"),
-            (Join-Path $buildDir "bin\tesseract.exe"),
-            (Join-Path $buildDir "Release\tesseract.exe"),
-            (Join-Path $buildDir "Release\bin\tesseract.exe")
-          ) | Where-Object { Test-Path $_ }
+          # Robustly locate tesseract.exe anywhere inside build directory
+          $exe = Get-ChildItem -Path $buildDir -Recurse -Filter "tesseract.exe" -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notmatch '\\CMakeFiles\\' } |
+            Select-Object -First 1
 
-          if ($exeCandidates.Count -eq 0) {
+          if (-not $exe) {
             Write-Host "Listing build directory for debugging:"
             Get-ChildItem -Recurse -File $buildDir | Select-Object FullName | Out-Host
-            throw "tesseract.exe not produced (could not find in known locations)."
+            throw "tesseract.exe not produced (could not find anywhere under $buildDir)."
           }
 
-          $tesseractExe = $exeCandidates[0]
-          Copy-Item $tesseractExe $runtimeDir -Force
-          Write-Host "Using tesseract.exe: $tesseractExe"
+          Write-Host "Using tesseract.exe: $($exe.FullName)"
+          Copy-Item $exe.FullName $runtimeDir -Force
 
+          # Copy runtime DLLs next to exe (broad but practical):
+          # - From build output
           Get-ChildItem -Path $buildDir -Recurse -Filter *.dll -File |
             Where-Object { $_.FullName -notmatch '\\CMakeFiles\\' } |
             ForEach-Object {
               Copy-Item $_.FullName $runtimeDir -Force -ErrorAction SilentlyContinue
             }
 
+          # - From vcpkg installed bin (needed DLLs for leptonica etc.)
           $vcpkgBin = Join-Path $env:VCPKG_ROOT "installed\$env:VCPKG_DEFAULT_TRIPLET\bin"
           if (Test-Path $vcpkgBin) {
             Get-ChildItem -Path $vcpkgBin -Filter *.dll -File |
@@ -149,11 +149,13 @@ jobs:
               }
           }
 
+          # Copy tessdata support folders if repo provides them (optional)
           $repoTessdata = Join-Path $env:GITHUB_WORKSPACE "tessdata"
           if (Test-Path $repoTessdata) {
             Copy-Item (Join-Path $repoTessdata "*") $tessdata -Recurse -Force -ErrorAction SilentlyContinue
           }
 
+          # Copy YOUR offline traineddata (mandatory)
           Copy-Item (Join-Path $env:GITHUB_WORKSPACE "assets\tessdata\eng.traineddata") $tessdata -Force
 
           Write-Host "dist_runtime:"
