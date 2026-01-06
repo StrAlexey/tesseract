@@ -16,13 +16,13 @@ jobs:
           chmod +x nsis/build.sh
           nsis/build.sh x86_64
 
-      # 2) Assemble runtime folder
+      # 2) Assemble runtime folder (FIXED PATH)
       - name: Assemble runtime folder
         run: |
           set -euo pipefail
 
           RUNTIME_DIR="dist_runtime"
-          MINGW_INSTALL_DIR="${PWD}/mingw64"
+          MINGW_INSTALL_DIR="/mingw64"
 
           if [ ! -d "$MINGW_INSTALL_DIR" ]; then
             echo "Missing $MINGW_INSTALL_DIR"
@@ -32,7 +32,7 @@ jobs:
           rm -rf "$RUNTIME_DIR"
           mkdir -p "$RUNTIME_DIR/tessdata"
 
-          # Main exe
+          # Main executable
           cp "$MINGW_INSTALL_DIR/bin/tesseract.exe" "$RUNTIME_DIR/"
 
           # DLLs
@@ -103,6 +103,7 @@ jobs:
             "DisableDirPage=yes",
             "DisableProgramGroupPage=yes",
             "PrivilegesRequired=lowest",
+            "ChangesEnvironment=yes",
             "",
             "OutputDir=output",
             "OutputBaseFilename=tesseract-ocr-installer-{#AppVersion}-win64",
@@ -118,7 +119,14 @@ jobs:
             "Source: ""{#SourcePath}\..\dist_runtime\*""; DestDir: ""{app}""; Flags: recursesubdirs createallsubdirs ignoreversion",
             "",
             "[Registry]",
-            "Root: HKCU; Subkey: ""Software\Tesseract-OCR""; ValueType: string; ValueName: ""Path""; ValueData: ""{app}""; Flags: uninsdeletekey"
+            "Root: HKCU; Subkey: ""Software\Tesseract-OCR""; ValueType: string; ValueName: ""Path""; ValueData: ""{app}""; Flags: uninsdeletekey",
+            "",
+            "[Code]",
+            "procedure CurStepChanged(CurStep: TSetupStep);",
+            "begin",
+            "  if CurStep = ssPostInstall then",
+            "    RegWriteStringValue(HKCU, 'Environment', 'Path', ExpandConstant('{app}'));",
+            "end;"
           )
 
           Set-Content -Path $issPath -Value $lines -Encoding UTF8
