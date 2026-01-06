@@ -65,6 +65,7 @@ jobs:
             -DVCPKG_TARGET_TRIPLET=x64-windows `
             -DCMAKE_BUILD_TYPE=Release `
             -DSW_BUILD=OFF `
+            -DUSE_PKGCONFIG=OFF `
             -DBUILD_TESTS=OFF `
             -DBUILD_TRAINING_TOOLS=OFF
 
