@@ -71,9 +71,6 @@ jobs:
         shell: pwsh
         working-directory: ${{ github.workspace }}
         run: |
-          # IMPORTANT:
-          # - leptonica is required
-          # - pkgconf provides pkg-config; without it CMake can't discover Leptonica on Windows in this setup
           & "$env:VCPKG_ROOT\vcpkg.exe" `
             --vcpkg-root "$env:VCPKG_ROOT" `
             --classic `
@@ -101,7 +98,6 @@ jobs:
             throw "Leptonica CMake package dir not found: $leptonicaDir"
           }
 
-          # Make pkg-config visible for FindPkgConfig too
           $env:PATH = (Split-Path $pkgconfExe -Parent) + ";" + $env:PATH
 
           cmake -S . -B $buildDir -G "Ninja" `
@@ -148,14 +144,12 @@ jobs:
           Write-Host "Using tesseract.exe: $($exe.FullName)"
           Copy-Item $exe.FullName $runtimeDir -Force
 
-          # DLLs from build tree
           Get-ChildItem -Path $buildDir -Recurse -Filter *.dll -File |
             Where-Object { $_.FullName -notmatch '\\CMakeFiles\\' } |
             ForEach-Object {
               Copy-Item $_.FullName $runtimeDir -Force -ErrorAction SilentlyContinue
             }
 
-          # DLLs from vcpkg bin
           $vcpkgBin = Join-Path $env:VCPKG_ROOT "installed\$env:VCPKG_DEFAULT_TRIPLET\bin"
           if (Test-Path $vcpkgBin) {
             Get-ChildItem -Path $vcpkgBin -Filter *.dll -File |
@@ -164,13 +158,11 @@ jobs:
               }
           }
 
-          # Optional repo tessdata (configs etc.) if present
           $repoTessdata = Join-Path $env:GITHUB_WORKSPACE "tessdata"
           if (Test-Path $repoTessdata) {
             Copy-Item (Join-Path $repoTessdata "*") $tessdata -Recurse -Force -ErrorAction SilentlyContinue
           }
 
-          # Mandatory offline traineddata
           Copy-Item (Join-Path $env:GITHUB_WORKSPACE "assets\tessdata\eng.traineddata") $tessdata -Force
 
           Write-Host "dist_runtime:"
@@ -337,10 +329,12 @@ jobs:
         shell: pwsh
         run: |
           iscc "packaging\tesseract.iss"
-          dir output
+          # FIX: output folder is relative to the .iss location => packaging\output
+          dir "packaging\output"
 
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
           name: Tesseract Installer (Inno Setup, D drive)
-          path: output\*.exe
+          # FIX: installer is in packaging\output
+          path: packaging\output\*.exe
