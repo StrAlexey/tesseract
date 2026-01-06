@@ -1,12 +1,4 @@
 # .github/workflows/installer-for-windows.yml
-#
-# Build Tesseract from source on Windows and package it into a silent-friendly installer (Inno Setup)
-# Install target: D:\Tesseract-OCR (no admin)
-# Also:
-#   - copies your offline eng.traineddata from assets/tessdata/eng.traineddata
-#   - adds D:\Tesseract-OCR to user PATH
-#   - sets user TESSDATA_PREFIX so Tesseract always finds tessdata
-
 name: Cross build for Windows
 
 on:
@@ -20,13 +12,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      # vcpkg is the cleanest way to build Tesseract on Windows in CI.
-      # It provides Leptonica and other dependencies in a predictable way.
-      - name: Set up vcpkg
-        uses: lukka/run-vcpkg@v11
-        with:
-          vcpkgDirectory: ${{ runner.temp }}\vcpkg
-          vcpkgGitCommitId: 6f29f12f6f2c5d9a8a4d8f7d1a2f9c6a2f6b7d11 # pinned for repeatability
+      - name: Validate offline traineddata exists in repo
+        shell: powershell
+        run: |
+          $trainedDataPath = Join-Path $env:GITHUB_WORKSPACE "assets\tessdata\eng.traineddata"
+          if (-not (Test-Path $trainedDataPath)) {
+            Write-Host "Missing file: $trainedDataPath"
+            Write-Host "Make sure it's committed and not ignored by .gitignore."
+            exit 1
+          }
+          Write-Host "OK: Found $trainedDataPath"
 
       - name: Install build tools
         shell: powershell
@@ -34,91 +29,95 @@ jobs:
           choco install innosetup -y
           choco install ninja -y
 
-      - name: Validate offline traineddata exists in repo
+      # ---- vcpkg (manual, no lukka/run-vcpkg) ----
+      - name: Clone and bootstrap vcpkg
         shell: powershell
         run: |
-          $trainedDataPath = Join-Path $env:GITHUB_WORKSPACE "assets\tessdata\eng.traineddata"
-          if (-not (Test-Path $trainedDataPath)) {
-            Write-Host "Missing file: $trainedDataPath"
-            Write-Host "Add it to repo (and ensure .gitignore does not ignore *.traineddata)."
-            exit 1
-          }
-          Write-Host "OK: Found $trainedDataPath"
+          $ErrorActionPreference = "Stop"
 
+          $vcpkgRoot = Join-Path $env:RUNNER_TEMP "vcpkg"
+          if (Test-Path $vcpkgRoot) { Remove-Item $vcpkgRoot -Recurse -Force }
+
+          git clone https://github.com/microsoft/vcpkg $vcpkgRoot
+          & "$vcpkgRoot\bootstrap-vcpkg.bat" -disableMetrics
+
+          "VCPKG_ROOT=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "VCPKG_ROOT=$vcpkgRoot"
+
+      - name: Install dependencies via vcpkg (x64-windows)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vcpkg = Join-Path $env:VCPKG_ROOT "vcpkg.exe"
+
+          # Minimal but practical deps. leptonica pulls most image libs.
+          & $vcpkg install leptonica:x64-windows
+
+      # ---- Build Tesseract from THIS repo using vcpkg toolchain ----
       - name: Build Tesseract (x64 Release)
         shell: powershell
-        env:
-          VCPKG_ROOT: ${{ runner.temp }}\vcpkg
         run: |
           $ErrorActionPreference = "Stop"
 
           $sourceRoot = $env:GITHUB_WORKSPACE
-          $buildRoot  = Join-Path $sourceRoot "build-win64"
-          $installRoot = Join-Path $sourceRoot "dist_runtime"
+          $buildRoot = Join-Path $sourceRoot "build-win64"
+          $runtimeRoot = Join-Path $sourceRoot "dist_runtime"
 
           if (Test-Path $buildRoot) { Remove-Item $buildRoot -Recurse -Force }
-          if (Test-Path $installRoot) { Remove-Item $installRoot -Recurse -Force }
+          if (Test-Path $runtimeRoot) { Remove-Item $runtimeRoot -Recurse -Force }
 
           New-Item -ItemType Directory -Force -Path $buildRoot | Out-Null
-          New-Item -ItemType Directory -Force -Path $installRoot | Out-Null
-          New-Item -ItemType Directory -Force -Path (Join-Path $installRoot "tessdata") | Out-Null
+          New-Item -ItemType Directory -Force -Path $runtimeRoot | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $runtimeRoot "tessdata") | Out-Null
 
-          $toolchainFile = Join-Path $env:VCPKG_ROOT "scripts\buildsystems\vcpkg.cmake"
+          $toolchain = Join-Path $env:VCPKG_ROOT "scripts\buildsystems\vcpkg.cmake"
 
-          # Configure
           cmake -S $sourceRoot -B $buildRoot -G "Ninja" `
             -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_TOOLCHAIN_FILE="$toolchainFile" `
+            -DCMAKE_TOOLCHAIN_FILE="$toolchain" `
             -DVCPKG_TARGET_TRIPLET="x64-windows" `
             -DBUILD_TRAINING_TOOLS=OFF `
             -DBUILD_SHARED_LIBS=ON
 
-          # Build
           cmake --build $buildRoot --config Release
 
-          # Locate produced tesseract.exe (path can vary slightly by generator/config)
-          $candidateExePaths = @(
-            Join-Path $buildRoot "bin\tesseract.exe",
-            Join-Path $buildRoot "bin\Release\tesseract.exe",
-            Join-Path $buildRoot "tesseract.exe",
-            Join-Path $buildRoot "Release\tesseract.exe"
-          )
+          # Find tesseract.exe inside build folder
+          $tesseractExe = Get-ChildItem -Path $buildRoot -Recurse -Filter "tesseract.exe" -File |
+            Select-Object -First 1
 
-          $tesseractExePath = $candidateExePaths | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $tesseractExePath) {
-            Write-Host "tesseract.exe not found in expected locations. Listing build output:"
-            Get-ChildItem -Recurse -File $buildRoot | Select-Object FullName | Out-Host
-            throw "tesseract.exe not produced by build."
+          if (-not $tesseractExe) {
+            Write-Host "tesseract.exe not found. Dumping build tree..."
+            Get-ChildItem -Path $buildRoot -Recurse -File | Select-Object FullName | Out-Host
+            throw "tesseract.exe not produced."
           }
 
-          Copy-Item -Force $tesseractExePath $installRoot
+          Copy-Item -Force $tesseractExe.FullName (Join-Path $runtimeRoot "tesseract.exe")
 
-          # Copy DLLs needed for runtime.
-          # - Build output might contain libtesseract/leptonica dlls
-          # - vcpkg has dependency dlls in installed\x64-windows\bin
+          # Copy runtime DLLs:
+          # 1) DLLs from build output directory (common)
+          # 2) DLLs from vcpkg installed bin
           $vcpkgBin = Join-Path $env:VCPKG_ROOT "installed\x64-windows\bin"
 
-          $dllSources = @(
-            (Join-Path $buildRoot "bin"),
-            (Join-Path $buildRoot "bin\Release"),
+          $dllDirs = @(
+            (Split-Path $tesseractExe.FullName -Parent),
             $vcpkgBin
           ) | Where-Object { Test-Path $_ } | Select-Object -Unique
 
-          foreach ($dllSource in $dllSources) {
-            Get-ChildItem -Path $dllSource -Filter "*.dll" -File -ErrorAction SilentlyContinue | ForEach-Object {
-              Copy-Item -Force $_.FullName $installRoot
+          foreach ($dir in $dllDirs) {
+            Get-ChildItem -Path $dir -Filter "*.dll" -File -ErrorAction SilentlyContinue | ForEach-Object {
+              Copy-Item -Force $_.FullName $runtimeRoot
             }
           }
 
           # Copy your offline traineddata
-          Copy-Item -Force (Join-Path $sourceRoot "assets\tessdata\eng.traineddata") (Join-Path $installRoot "tessdata\eng.traineddata")
+          Copy-Item -Force (Join-Path $sourceRoot "assets\tessdata\eng.traineddata") (Join-Path $runtimeRoot "tessdata\eng.traineddata")
 
-          # Sanity check: runtime layout
           Write-Host "dist_runtime content:"
-          Get-ChildItem -Path $installRoot -File | Select-Object Name, Length | Format-Table -AutoSize | Out-Host
+          Get-ChildItem -Path $runtimeRoot -File | Select-Object Name, Length | Format-Table -AutoSize | Out-Host
           Write-Host "dist_runtime\tessdata content:"
-          Get-ChildItem -Path (Join-Path $installRoot "tessdata") -File | Select-Object Name, Length | Format-Table -AutoSize | Out-Host
+          Get-ChildItem -Path (Join-Path $runtimeRoot "tessdata") -File | Select-Object Name, Length | Format-Table -AutoSize | Out-Host
 
+      # ---- Inno Setup packaging to D:\Tesseract-OCR + PATH ----
       - name: Create Inno Setup script
         shell: powershell
         run: |
@@ -144,7 +143,6 @@ jobs:
           DisableDirPage=yes
           DisableProgramGroupPage=yes
 
-          ; Install without admin rights (D:\ is usually writable for the user in your setup)
           PrivilegesRequired=lowest
 
           OutputDir=output
@@ -158,56 +156,55 @@ jobs:
           Name: "english"; MessagesFile: "compiler:Default.isl"
 
           [Files]
-          ; Copy the prepared runtime folder into D:\Tesseract-OCR
           Source: "{#SourcePath}\..\dist_runtime\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
 
           [Registry]
-          ; Store install path for easy discovery (per-user)
           Root: HKCU; Subkey: "Software\Tesseract-OCR"; ValueType: string; ValueName: "Path"; ValueData: "{app}"; Flags: uninsdeletekey
-
-          ; Ensure Tesseract always finds tessdata (we ship {app}\tessdata)
           Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "TESSDATA_PREFIX"; ValueData: "{app}"; Flags: preservestringtype
 
           [Code]
-          function PathContainsInstallDir(const ExistingPath, InstallDir: string): Boolean;
+          function PathContains(const ExistingPath, Dir: string): Boolean;
           begin
-            Result := (Pos(';' + Lowercase(InstallDir) + ';', ';' + Lowercase(ExistingPath) + ';') > 0);
+            Result := (Pos(';' + Lowercase(Dir) + ';', ';' + Lowercase(ExistingPath) + ';') > 0);
           end;
 
-          procedure AddToUserPath(const InstallDir: string);
+          procedure AddToUserPath(const Dir: string);
           var
             ExistingPath: string;
           begin
             if not RegQueryStringValue(HKCU, 'Environment', 'Path', ExistingPath) then
               ExistingPath := '';
 
-            if not PathContainsInstallDir(ExistingPath, InstallDir) then
+            if not PathContains(ExistingPath, Dir) then
             begin
               if (ExistingPath <> '') and (Copy(ExistingPath, Length(ExistingPath), 1) <> ';') then
                 ExistingPath := ExistingPath + ';';
-
-              ExistingPath := ExistingPath + InstallDir;
+              ExistingPath := ExistingPath + Dir;
               RegWriteExpandStringValue(HKCU, 'Environment', 'Path', ExistingPath);
             end;
           end;
 
-          procedure RemoveFromUserPath(const InstallDir: string);
+          procedure RemoveFromUserPath(const Dir: string);
           var
             ExistingPath: string;
             NormalizedPath: string;
             Needle: string;
+            P: Integer;
           begin
             if not RegQueryStringValue(HKCU, 'Environment', 'Path', ExistingPath) then
               exit;
 
             NormalizedPath := ';' + ExistingPath + ';';
-            Needle := ';' + InstallDir + ';';
+            Needle := ';' + Dir + ';';
 
-            while Pos(Lowercase(Needle), Lowercase(NormalizedPath)) > 0 do
-              Delete(NormalizedPath, Pos(Lowercase(Needle), Lowercase(NormalizedPath)), Length(Needle) - 1);
+            P := Pos(Lowercase(Needle), Lowercase(NormalizedPath));
+            while P > 0 do
+            begin
+              Delete(NormalizedPath, P, Length(Needle) - 1);
+              P := Pos(Lowercase(Needle), Lowercase(NormalizedPath));
+            end;
 
-            ; Trim wrapper semicolons
-            if (Length(NormalizedPath) >= 2) and (Copy(NormalizedPath, 1, 1) = ';') then
+            if (Length(NormalizedPath) >= 1) and (Copy(NormalizedPath, 1, 1) = ';') then
               Delete(NormalizedPath, 1, 1);
             if (Length(NormalizedPath) >= 1) and (Copy(NormalizedPath, Length(NormalizedPath), 1) = ';') then
               Delete(NormalizedPath, Length(NormalizedPath), 1);
@@ -218,22 +215,17 @@ jobs:
           procedure CurStepChanged(CurStep: TSetupStep);
           begin
             if CurStep = ssPostInstall then
-            begin
               AddToUserPath(ExpandConstant('{app}'));
-            end;
           end;
 
           procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
           begin
             if CurUninstallStep = usPostUninstall then
-            begin
               RemoveFromUserPath(ExpandConstant('{app}'));
-            end;
           end;
           "@ | Set-Content -Encoding UTF8 $issPath
 
           Write-Host "Created: $issPath"
-          Get-Content $issPath | Select-Object -First 40 | Out-Host
 
       - name: Build installer (Inno Setup)
         shell: powershell
@@ -241,7 +233,7 @@ jobs:
           iscc "packaging\tesseract.iss"
           dir output
 
-      - name: Upload Inno Setup installer
+      - name: Upload installer artifact
         uses: actions/upload-artifact@v6
         with:
           name: Tesseract Installer (Inno Setup, D drive)
