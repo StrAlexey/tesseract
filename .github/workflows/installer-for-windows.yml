@@ -1,4 +1,3 @@
-# .github/workflows/installer-for-windows.yml
 name: Cross build for Windows
 
 on:
@@ -18,7 +17,6 @@ jobs:
           $trainedDataPath = Join-Path $env:GITHUB_WORKSPACE "assets\tessdata\eng.traineddata"
           if (-not (Test-Path $trainedDataPath)) {
             Write-Host "Missing file: $trainedDataPath"
-            Write-Host "Make sure it's committed and not ignored by .gitignore."
             exit 1
           }
           Write-Host "OK: Found $trainedDataPath"
@@ -50,25 +48,21 @@ jobs:
           $ErrorActionPreference = "Stop"
           $vcpkg = Join-Path $env:VCPKG_ROOT "vcpkg.exe"
 
-          # Minimal but practical deps. leptonica pulls most image libs.
-          & $vcpkg install leptonica:x64-windows
+          # Wider set to avoid "missing <...>" surprises on Windows builds.
+          # leptonica pulls image libs; icu/libarchive are common optional deps.
+          & $vcpkg install leptonica:x64-windows icu:x64-windows libarchive:x64-windows
 
       # ---- Build Tesseract from THIS repo using vcpkg toolchain ----
-      - name: Build Tesseract (x64 Release)
+      - name: Configure Tesseract (CMake)
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
 
           $sourceRoot = $env:GITHUB_WORKSPACE
           $buildRoot = Join-Path $sourceRoot "build-win64"
-          $runtimeRoot = Join-Path $sourceRoot "dist_runtime"
 
           if (Test-Path $buildRoot) { Remove-Item $buildRoot -Recurse -Force }
-          if (Test-Path $runtimeRoot) { Remove-Item $runtimeRoot -Recurse -Force }
-
           New-Item -ItemType Directory -Force -Path $buildRoot | Out-Null
-          New-Item -ItemType Directory -Force -Path $runtimeRoot | Out-Null
-          New-Item -ItemType Directory -Force -Path (Join-Path $runtimeRoot "tessdata") | Out-Null
 
           $toolchain = Join-Path $env:VCPKG_ROOT "scripts\buildsystems\vcpkg.cmake"
 
@@ -77,25 +71,75 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="$toolchain" `
             -DVCPKG_TARGET_TRIPLET="x64-windows" `
             -DBUILD_TRAINING_TOOLS=OFF `
-            -DBUILD_SHARED_LIBS=ON
+            -DBUILD_SHARED_LIBS=ON `
+            -DBUILD_TESTS=OFF `
+            -DBUILD_TESSERACT=ON `
+            -DCMAKE_INSTALL_PREFIX="$($buildRoot)\_install"
 
-          cmake --build $buildRoot --config Release
+      - name: Build target tesseract (x64 Release)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
 
-          # Find tesseract.exe inside build folder
-          $tesseractExe = Get-ChildItem -Path $buildRoot -Recurse -Filter "tesseract.exe" -File |
-            Select-Object -First 1
+          $sourceRoot = $env:GITHUB_WORKSPACE
+          $buildRoot = Join-Path $sourceRoot "build-win64"
 
+          try {
+            cmake --build $buildRoot --config Release --target tesseract --verbose
+          }
+          catch {
+            Write-Host "Build failed. Dumping Ninja log if present..."
+            $ninjaLog = Join-Path $buildRoot ".ninja_log"
+            if (Test-Path $ninjaLog) {
+              Write-Host "---- .ninja_log (tail) ----"
+              Get-Content $ninjaLog -Tail 200 | Out-Host
+            }
+            throw
+          }
+
+      - name: Install build outputs (cmake --install)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $sourceRoot = $env:GITHUB_WORKSPACE
+          $buildRoot = Join-Path $sourceRoot "build-win64"
+
+          cmake --install $buildRoot --config Release
+
+          $installDir = Join-Path $buildRoot "_install"
+          if (-not (Test-Path $installDir)) {
+            throw "Install directory not found: $installDir"
+          }
+
+          Write-Host "Installed tree (top):"
+          Get-ChildItem -Path $installDir | Select-Object Name | Out-Host
+
+      - name: Assemble runtime folder (dist_runtime)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $sourceRoot = $env:GITHUB_WORKSPACE
+          $buildRoot = Join-Path $sourceRoot "build-win64"
+          $installDir = Join-Path $buildRoot "_install"
+          $runtimeRoot = Join-Path $sourceRoot "dist_runtime"
+
+          if (Test-Path $runtimeRoot) { Remove-Item $runtimeRoot -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $runtimeRoot | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $runtimeRoot "tessdata") | Out-Null
+
+          # Find tesseract.exe from installed prefix
+          $tesseractExe = Get-ChildItem -Path $installDir -Recurse -Filter "tesseract.exe" -File | Select-Object -First 1
           if (-not $tesseractExe) {
-            Write-Host "tesseract.exe not found. Dumping build tree..."
-            Get-ChildItem -Path $buildRoot -Recurse -File | Select-Object FullName | Out-Host
+            Write-Host "tesseract.exe not found under install dir. Dumping files..."
+            Get-ChildItem -Path $installDir -Recurse -File | Select-Object FullName | Out-Host
             throw "tesseract.exe not produced."
           }
 
           Copy-Item -Force $tesseractExe.FullName (Join-Path $runtimeRoot "tesseract.exe")
 
-          # Copy runtime DLLs:
-          # 1) DLLs from build output directory (common)
-          # 2) DLLs from vcpkg installed bin
+          # Copy DLLs from install tree and vcpkg bin
           $vcpkgBin = Join-Path $env:VCPKG_ROOT "installed\x64-windows\bin"
 
           $dllDirs = @(
@@ -109,7 +153,7 @@ jobs:
             }
           }
 
-          # Copy your offline traineddata
+          # Offline traineddata (your file)
           Copy-Item -Force (Join-Path $sourceRoot "assets\tessdata\eng.traineddata") (Join-Path $runtimeRoot "tessdata\eng.traineddata")
 
           Write-Host "dist_runtime content:"
@@ -224,8 +268,6 @@ jobs:
               RemoveFromUserPath(ExpandConstant('{app}'));
           end;
           "@ | Set-Content -Encoding UTF8 $issPath
-
-          Write-Host "Created: $issPath"
 
       - name: Build installer (Inno Setup)
         shell: powershell
