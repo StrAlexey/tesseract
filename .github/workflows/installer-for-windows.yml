@@ -48,7 +48,6 @@ jobs:
             Write-Host "vcpkg already exists at $env:VCPKG_ROOT"
           }
 
-          # Ensure we really have a "classic-capable" vcpkg root
           $marker = Join-Path $env:VCPKG_ROOT ".vcpkg-root"
           if (!(Test-Path $marker)) {
             throw "vcpkg root marker not found: $marker. The cloned vcpkg folder is not a valid classic vcpkg instance."
@@ -72,7 +71,6 @@ jobs:
         shell: pwsh
         working-directory: ${{ github.workspace }}
         run: |
-          # Force classic mode explicitly (fixes: "manifest not found" + "no classic mode instance")
           & "$env:VCPKG_ROOT\vcpkg.exe" `
             --vcpkg-root "$env:VCPKG_ROOT" `
             --classic `
@@ -118,7 +116,6 @@ jobs:
           New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
           New-Item -ItemType Directory -Force -Path $tessdata   | Out-Null
 
-          # Robustly locate tesseract.exe anywhere inside build directory
           $exe = Get-ChildItem -Path $buildDir -Recurse -Filter "tesseract.exe" -File -ErrorAction SilentlyContinue |
             Where-Object { $_.FullName -notmatch '\\CMakeFiles\\' } |
             Select-Object -First 1
@@ -132,15 +129,12 @@ jobs:
           Write-Host "Using tesseract.exe: $($exe.FullName)"
           Copy-Item $exe.FullName $runtimeDir -Force
 
-          # Copy runtime DLLs next to exe (broad but practical):
-          # - From build output
           Get-ChildItem -Path $buildDir -Recurse -Filter *.dll -File |
             Where-Object { $_.FullName -notmatch '\\CMakeFiles\\' } |
             ForEach-Object {
               Copy-Item $_.FullName $runtimeDir -Force -ErrorAction SilentlyContinue
             }
 
-          # - From vcpkg installed bin (needed DLLs for leptonica etc.)
           $vcpkgBin = Join-Path $env:VCPKG_ROOT "installed\$env:VCPKG_DEFAULT_TRIPLET\bin"
           if (Test-Path $vcpkgBin) {
             Get-ChildItem -Path $vcpkgBin -Filter *.dll -File |
@@ -149,13 +143,11 @@ jobs:
               }
           }
 
-          # Copy tessdata support folders if repo provides them (optional)
           $repoTessdata = Join-Path $env:GITHUB_WORKSPACE "tessdata"
           if (Test-Path $repoTessdata) {
             Copy-Item (Join-Path $repoTessdata "*") $tessdata -Recurse -Force -ErrorAction SilentlyContinue
           }
 
-          # Copy YOUR offline traineddata (mandatory)
           Copy-Item (Join-Path $env:GITHUB_WORKSPACE "assets\tessdata\eng.traineddata") $tessdata -Force
 
           Write-Host "dist_runtime:"
@@ -215,10 +207,26 @@ jobs:
           Root: HKCU; Subkey: "Software\Tesseract-OCR"; ValueType: string; ValueName: "Path"; ValueData: "{app}"; Flags: uninsdeletekey
 
           [Code]
+          const
+            HWND_BROADCAST   = $FFFF;
+            WM_SETTINGCHANGE = $001A;
+            SMTO_ABORTIFHUNG = $0002;
+
+          function SendMessageTimeout(hWnd: Longint; Msg: Longint; wParam: Longint; lParam: string;
+            fuFlags: Longint; uTimeout: Longint; var lpdwResult: Longint): Longint;
+            external 'SendMessageTimeoutW@user32.dll stdcall';
+
+          procedure BroadcastEnvironmentChange;
+          var
+            ResultCode: Longint;
+          begin
+            ResultCode := 0;
+            SendMessageTimeout(HWND_BROADCAST, WM_SETTINGCHANGE, 0, 'Environment', SMTO_ABORTIFHUNG, 5000, ResultCode);
+          end;
+
           procedure EnvAddPathUser(const NewPath: string);
           var
             Paths: string;
-            ResultCode: DWORD;
           begin
             if RegQueryStringValue(HKCU, 'Environment', 'Path', Paths) then
             begin
@@ -229,7 +237,7 @@ jobs:
               Paths := NewPath;
 
             RegWriteStringValue(HKCU, 'Environment', 'Path', Paths);
-            SendMessageTimeout(HWND_BROADCAST, WM_SETTINGCHANGE, 0, 'Environment', SMTO_ABORTIFHUNG, 5000, ResultCode);
+            BroadcastEnvironmentChange;
           end;
 
           procedure EnvRemovePathUser(const RemovePath: string);
@@ -237,7 +245,6 @@ jobs:
             Paths, NewPaths: string;
             Parts: TArrayOfString;
             I: Integer;
-            ResultCode: DWORD;
           begin
             if not RegQueryStringValue(HKCU, 'Environment', 'Path', Paths) then
               exit;
@@ -257,7 +264,7 @@ jobs:
             end;
 
             RegWriteStringValue(HKCU, 'Environment', 'Path', NewPaths);
-            SendMessageTimeout(HWND_BROADCAST, WM_SETTINGCHANGE, 0, 'Environment', SMTO_ABORTIFHUNG, 5000, ResultCode);
+            BroadcastEnvironmentChange;
           end;
 
           procedure CurStepChanged(CurStep: TSetupStep);
@@ -274,7 +281,7 @@ jobs:
           "@ | Set-Content -Encoding UTF8 $issPath
 
           Write-Host "Created: $issPath"
-          Get-Content $issPath | Select-Object -First 80 | Out-Host
+          Get-Content $issPath | Select-Object -First 120 | Out-Host
 
       - name: Build installer (Inno Setup)
         shell: pwsh
