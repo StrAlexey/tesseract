@@ -1,4 +1,4 @@
-name: Tesseract Installer for Windows (Inno Setup, D drive)
+name: Cross build for Windows
 
 on:
   workflow_dispatch:
