@@ -115,3 +115,8 @@ times.txt
 
 /*.snap
 /*_source.tar.bz2
+
+# --- allow custom OCR traineddata ---
+!assets/
+!assets/tessdata/
+!assets/tessdata/eng.traineddata
