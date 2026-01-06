@@ -36,7 +36,15 @@ jobs:
         run: |
           vcpkg\bootstrap-vcpkg.bat -disableMetrics
 
-      - name: Install deps
+      - name: Install build tools
+        shell: pwsh
+        run: |
+          choco install -y cmake ninja innosetup
+
+      - name: Setup MSVC Dev Cmd
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install deps (vcpkg)
         shell: pwsh
         run: |
           vcpkg\vcpkg.exe --classic install leptonica:x64-windows
@@ -44,10 +52,18 @@ jobs:
       - name: Configure
         shell: pwsh
         run: |
-          cmake -S . -B build-win64 -G Ninja `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_TOOLCHAIN_FILE=vcpkg\scripts\buildsystems\vcpkg.cmake `
+          $buildDir = "build-win64"
+          $toolchain = "$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake"
+          $ninja = "C:\ProgramData\chocolatey\bin\ninja.exe"
+
+          if (!(Test-Path $ninja)) { throw "Ninja not found" }
+          if (!(Test-Path $toolchain)) { throw "vcpkg toolchain not found" }
+
+          cmake -S . -B $buildDir -G Ninja `
+            -DCMAKE_MAKE_PROGRAM="$ninja" `
+            -DCMAKE_TOOLCHAIN_FILE="$toolchain" `
             -DVCPKG_TARGET_TRIPLET=x64-windows `
+            -DCMAKE_BUILD_TYPE=Release `
             -DSW_BUILD=OFF `
             -DBUILD_TESTS=OFF `
             -DBUILD_TRAINING_TOOLS=OFF
