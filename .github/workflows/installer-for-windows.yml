@@ -1,5 +1,3 @@
-# .github/workflows/installer-for-windows.yml
-
 name: Cross build for Windows
 
 on:
@@ -15,115 +13,61 @@ jobs:
       INSTALL_DIR: D:\Tesseract-OCR
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Validate offline traineddata exists in repo
+      - name: Validate traineddata
         shell: pwsh
         run: |
-          $td = Join-Path $env:GITHUB_WORKSPACE "assets\tessdata\eng.traineddata"
-          if (!(Test-Path $td)) {
-            throw "Missing required file: $td"
+          if (!(Test-Path "assets\tessdata\eng.traineddata")) {
+            throw "assets/tessdata/eng.traineddata missing"
           }
 
       - name: Clone vcpkg
         shell: pwsh
         run: |
-          if (!(Test-Path $env:VCPKG_ROOT)) {
-            git clone --depth 1 https://github.com/microsoft/vcpkg $env:VCPKG_ROOT
+          if (!(Test-Path vcpkg)) {
+            git clone https://github.com/microsoft/vcpkg vcpkg
           }
 
       - name: Bootstrap vcpkg
         shell: pwsh
         run: |
-          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
+          vcpkg\bootstrap-vcpkg.bat -disableMetrics
 
-      - name: Install build tools
+      - name: Install deps
         shell: pwsh
         run: |
-          choco install -y cmake ninja innosetup
+          vcpkg\vcpkg.exe --classic install leptonica:x64-windows
 
-      - name: Install Tesseract dependencies
-        shell: pwsh
-        run: |
-          & "$env:VCPKG_ROOT\vcpkg.exe" --classic install leptonica:$env:VCPKG_DEFAULT_TRIPLET
-
-      - name: Configure Tesseract
+      - name: Configure
         shell: pwsh
         run: |
           cmake -S . -B build-win64 -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" `
-            -DVCPKG_TARGET_TRIPLET="$env:VCPKG_DEFAULT_TRIPLET" `
+            -DCMAKE_TOOLCHAIN_FILE=vcpkg\scripts\buildsystems\vcpkg.cmake `
+            -DVCPKG_TARGET_TRIPLET=x64-windows `
             -DSW_BUILD=OFF `
             -DBUILD_TESTS=OFF `
-            -DBUILD_TRAINING_TOOLS=OFF `
-            -DBUILD_SHARED_LIBS=ON
+            -DBUILD_TRAINING_TOOLS=OFF
 
-      - name: Build Tesseract
+      - name: Build
         shell: pwsh
         run: |
           cmake --build build-win64 --target tesseract
 
-      - name: Assemble runtime folder
+      - name: Assemble runtime
         shell: pwsh
         run: |
-          $runtime = "dist_runtime"
-          Remove-Item $runtime -Recurse -Force -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force $runtime\tessdata | Out-Null
+          Remove-Item dist_runtime -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item dist_runtime\tessdata -ItemType Directory | Out-Null
 
           $exe = Get-ChildItem build-win64 -Recurse -Filter tesseract.exe | Select-Object -First 1
           if (-not $exe) { throw "tesseract.exe not found" }
-          Copy-Item $exe.FullName $runtime
 
-          Get-ChildItem build-win64 -Recurse -Filter *.dll | Copy-Item -Destination $runtime -Force -ErrorAction SilentlyContinue
-          Get-ChildItem "$env:VCPKG_ROOT\installed\$env:VCPKG_DEFAULT_TRIPLET\bin" -Filter *.dll | Copy-Item -Destination $runtime -Force -ErrorAction SilentlyContinue
-
-          Copy-Item assets\tessdata\eng.traineddata $runtime\tessdata -Force
-
-      - name: Create Inno Setup script
-        shell: pwsh
-        run: |
-          New-Item packaging -ItemType Directory -Force | Out-Null
-
-          @"
-#define AppName "Tesseract-OCR"
-#define AppVersion "dev"
-#define InstallDir "$env:INSTALL_DIR"
-
-[Setup]
-AppName={#AppName}
-AppVersion={#AppVersion}
-DefaultDirName={#InstallDir}
-PrivilegesRequired=lowest
-OutputDir=..\output
-OutputBaseFilename=tesseract-installer
-Compression=lzma2
-SolidCompression=yes
-
-[Files]
-Source: "{#SourcePath}\..\dist_runtime\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs
-
-[Code]
-procedure AddPathUser(Path: string);
-var
-  S: string;
-begin
-  if RegQueryStringValue(HKCU, 'Environment', 'Path', S) then
-    if Pos(LowerCase(Path), LowerCase(S)) = 0 then
-      RegWriteStringValue(HKCU, 'Environment', 'Path', S + ';' + Path)
-  else
-    RegWriteStringValue(HKCU, 'Environment', 'Path', Path);
-end;
-
-procedure CurStepChanged(Step: TSetupStep);
-begin
-  if Step = ssPostInstall then
-    AddPathUser(ExpandConstant('{app}'));
-end;
-"@ | Set-Content packaging\tesseract.iss -Encoding UTF8
+          Copy-Item $exe.FullName dist_runtime
+          Copy-Item assets\tessdata\eng.traineddata dist_runtime\tessdata
 
       - name: Build installer
         shell: pwsh
@@ -134,4 +78,4 @@ end;
         uses: actions/upload-artifact@v4
         with:
           name: Tesseract Installer
-          path: output\*.exe
+          path: packaging\output\*.exe
