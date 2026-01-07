@@ -64,6 +64,12 @@ jobs:
           choco install -y cmake ninja innosetup
           & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
 
+      # ✅ FIX: force MSVC developer environment (prevents accidental MinGW toolchain)
+      - name: Setup MSVC dev cmd (x64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       # ----------------------------------------
       # Install deps via vcpkg
       # ----------------------------------------
@@ -100,6 +106,10 @@ jobs:
 
           $env:PATH = (Split-Path $pkgconfExe -Parent) + ";" + $env:PATH
 
+          # ✅ FIX: make MSVC explicit
+          Write-Host "cl.exe:"
+          (Get-Command cl).Source | Out-Host
+
           cmake -S . -B $buildDir -G "Ninja" `
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_TOOLCHAIN_FILE="$toolchain" `
@@ -109,13 +119,41 @@ jobs:
             -DSW_BUILD=OFF `
             -DBUILD_TESTS=OFF `
             -DBUILD_TRAINING_TOOLS=OFF `
-            -DBUILD_SHARED_LIBS=ON
+            -DBUILD_SHARED_LIBS=ON `
+            -DCMAKE_C_COMPILER=cl `
+            -DCMAKE_CXX_COMPILER=cl
 
       - name: Build target tesseract (x64 Release)
         shell: pwsh
         run: |
           $buildDir = Join-Path $env:GITHUB_WORKSPACE "build-win64"
           cmake --build $buildDir --config Release --target tesseract
+
+      # ✅ FIX: fail early if the produced tesseract.exe is MinGW-linked
+      - name: Sanity check dependencies (must be MSVC, not MinGW)
+        shell: pwsh
+        run: |
+          $buildDir = Join-Path $env:GITHUB_WORKSPACE "build-win64"
+
+          $exe = Get-ChildItem -Path $buildDir -Recurse -Filter "tesseract.exe" -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notmatch '\\CMakeFiles\\' } |
+            Select-Object -First 1
+
+          if (-not $exe) {
+            throw "tesseract.exe not found for dependency check."
+          }
+
+          $deps = (& dumpbin /dependents $exe.FullName) -join "`n"
+          $bad  = @("libgcc_s_seh-1.dll", "libstdc++-6.dll", "libwinpthread-1.dll")
+
+          foreach ($b in $bad) {
+            if ($deps -match [Regex]::Escape($b)) {
+              Write-Host $deps
+              throw "Produced tesseract.exe depends on MinGW runtime ($b). This means the build used a MinGW/GCC toolchain. Fix toolchain to MSVC; do not ship this installer."
+            }
+          }
+
+          Write-Host "OK: No MinGW runtime dependencies detected."
 
       # -----------------------------
       # Assemble runtime folder
@@ -144,39 +182,6 @@ jobs:
           Write-Host "Using tesseract.exe: $($exe.FullName)"
           Copy-Item $exe.FullName $runtimeDir -Force
 
-          # --- FIX: Ensure dumpbin is available (applocal.ps1 relies on it on Windows) ---
-          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
-          if (Test-Path $vswhere) {
-            $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-            if ($vsPath) {
-              $dumpbin = Get-ChildItem -Path (Join-Path $vsPath "VC\Tools\MSVC") -Recurse -Filter "dumpbin.exe" -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.FullName -match "\\bin\\Hostx64\\x64\\dumpbin\.exe$" } |
-                Select-Object -First 1
-              if ($dumpbin) {
-                $env:PATH = (Split-Path $dumpbin.FullName -Parent) + ";" + $env:PATH
-              }
-            }
-          }
-          # --- END FIX ---
-
-          # --- FIX: Collect runtime dependencies next to tesseract.exe using vcpkg applocal (no manual DLL list) ---
-          $installedDir = Join-Path $env:VCPKG_ROOT "installed\$env:VCPKG_DEFAULT_TRIPLET"
-          $appLocal     = Join-Path $env:VCPKG_ROOT "scripts\buildsystems\msbuild\applocal.ps1"
-          $targetExe    = Join-Path $runtimeDir "tesseract.exe"
-
-          if (!(Test-Path $appLocal)) {
-            throw "vcpkg applocal.ps1 not found: $appLocal"
-          }
-          if (!(Test-Path $installedDir)) {
-            throw "vcpkg installed dir not found: $installedDir"
-          }
-
-          powershell -NoProfile -ExecutionPolicy Bypass -File "$appLocal" `
-            -targetBinary "$targetExe" `
-            -installedDir "$installedDir"
-          # --- END FIX ---
-
-          # Copy DLLs from build output
           Get-ChildItem -Path $buildDir -Recurse -Filter *.dll -File |
             Where-Object { $_.FullName -notmatch '\\CMakeFiles\\' } |
             ForEach-Object {
@@ -197,20 +202,6 @@ jobs:
           }
 
           Copy-Item (Join-Path $env:GITHUB_WORKSPACE "assets\tessdata\eng.traineddata") $tessdata -Force
-
-          # --- SAFETY: If the build ended up depending on MinGW runtime DLLs, copy them if available ---
-          $mingwRuntime = @("libgcc_s_seh-1.dll", "libstdc++-6.dll", "libwinpthread-1.dll")
-          foreach ($dll in $mingwRuntime) {
-            $dst = Join-Path $runtimeDir $dll
-            if (Test-Path $dst) { continue }
-
-            $hit = Get-ChildItem -Path $env:GITHUB_WORKSPACE -Recurse -Filter $dll -File -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($hit) {
-              Copy-Item $hit.FullName $runtimeDir -Force
-              Write-Host "Copied $dll from $($hit.FullName)"
-            }
-          }
-          # --- END SAFETY ---
 
           Write-Host "dist_runtime:"
           Get-ChildItem -Path $runtimeDir -Force | Format-Table Name, Length
@@ -376,12 +367,10 @@ jobs:
         shell: pwsh
         run: |
           iscc "packaging\tesseract.iss"
-          # FIX: output folder is relative to the .iss location => packaging\output
           dir "packaging\output"
 
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
           name: Tesseract Installer (Inno Setup, D drive)
-          # FIX: installer is in packaging\output
           path: packaging\output\*.exe
