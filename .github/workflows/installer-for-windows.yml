@@ -144,6 +144,39 @@ jobs:
           Write-Host "Using tesseract.exe: $($exe.FullName)"
           Copy-Item $exe.FullName $runtimeDir -Force
 
+          # --- FIX: Ensure dumpbin is available (applocal.ps1 relies on it on Windows) ---
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          if (Test-Path $vswhere) {
+            $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+            if ($vsPath) {
+              $dumpbin = Get-ChildItem -Path (Join-Path $vsPath "VC\Tools\MSVC") -Recurse -Filter "dumpbin.exe" -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -match "\\bin\\Hostx64\\x64\\dumpbin\.exe$" } |
+                Select-Object -First 1
+              if ($dumpbin) {
+                $env:PATH = (Split-Path $dumpbin.FullName -Parent) + ";" + $env:PATH
+              }
+            }
+          }
+          # --- END FIX ---
+
+          # --- FIX: Collect runtime dependencies next to tesseract.exe using vcpkg applocal (no manual DLL list) ---
+          $installedDir = Join-Path $env:VCPKG_ROOT "installed\$env:VCPKG_DEFAULT_TRIPLET"
+          $appLocal     = Join-Path $env:VCPKG_ROOT "scripts\buildsystems\msbuild\applocal.ps1"
+          $targetExe    = Join-Path $runtimeDir "tesseract.exe"
+
+          if (!(Test-Path $appLocal)) {
+            throw "vcpkg applocal.ps1 not found: $appLocal"
+          }
+          if (!(Test-Path $installedDir)) {
+            throw "vcpkg installed dir not found: $installedDir"
+          }
+
+          powershell -NoProfile -ExecutionPolicy Bypass -File "$appLocal" `
+            -targetBinary "$targetExe" `
+            -installedDir "$installedDir"
+          # --- END FIX ---
+
+          # Copy DLLs from build output
           Get-ChildItem -Path $buildDir -Recurse -Filter *.dll -File |
             Where-Object { $_.FullName -notmatch '\\CMakeFiles\\' } |
             ForEach-Object {
@@ -164,6 +197,20 @@ jobs:
           }
 
           Copy-Item (Join-Path $env:GITHUB_WORKSPACE "assets\tessdata\eng.traineddata") $tessdata -Force
+
+          # --- SAFETY: If the build ended up depending on MinGW runtime DLLs, copy them if available ---
+          $mingwRuntime = @("libgcc_s_seh-1.dll", "libstdc++-6.dll", "libwinpthread-1.dll")
+          foreach ($dll in $mingwRuntime) {
+            $dst = Join-Path $runtimeDir $dll
+            if (Test-Path $dst) { continue }
+
+            $hit = Get-ChildItem -Path $env:GITHUB_WORKSPACE -Recurse -Filter $dll -File -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($hit) {
+              Copy-Item $hit.FullName $runtimeDir -Force
+              Write-Host "Copied $dll from $($hit.FullName)"
+            }
+          }
+          # --- END SAFETY ---
 
           Write-Host "dist_runtime:"
           Get-ChildItem -Path $runtimeDir -Force | Format-Table Name, Length
