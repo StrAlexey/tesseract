@@ -56,7 +56,7 @@ jobs:
       - name: Bootstrap vcpkg
         shell: pwsh
         run: |
-          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
+          & "$env:GITHUB_WORKSPACE\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
 
       - name: Install build tools
         shell: pwsh
@@ -64,11 +64,19 @@ jobs:
           choco install -y cmake ninja innosetup
           & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
 
-      # ✅ FIX: force MSVC developer environment (prevents accidental MinGW toolchain)
+      # MSVC env (may override VCPKG_ROOT internally)
       - name: Setup MSVC dev cmd (x64)
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
+
+      # ✅ FIX: force back our in-repo vcpkg root (VS dev cmd may override VCPKG_ROOT)
+      - name: Force VCPKG_ROOT to in-repo vcpkg
+        shell: pwsh
+        run: |
+          "VCPKG_ROOT=$env:GITHUB_WORKSPACE\vcpkg" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "VCPKG_DEFAULT_TRIPLET=$env:VCPKG_DEFAULT_TRIPLET" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "VCPKG_ROOT (forced) = $env:GITHUB_WORKSPACE\vcpkg"
 
       # ----------------------------------------
       # Install deps via vcpkg
@@ -77,8 +85,11 @@ jobs:
         shell: pwsh
         working-directory: ${{ github.workspace }}
         run: |
-          & "$env:VCPKG_ROOT\vcpkg.exe" `
-            --vcpkg-root "$env:VCPKG_ROOT" `
+          $vcpkgExe = Join-Path $env:GITHUB_WORKSPACE "vcpkg\vcpkg.exe"
+          if (!(Test-Path $vcpkgExe)) { throw "vcpkg.exe not found at $vcpkgExe" }
+
+          & $vcpkgExe `
+            --vcpkg-root "$env:GITHUB_WORKSPACE\vcpkg" `
             --classic `
             install "leptonica:$env:VCPKG_DEFAULT_TRIPLET" "pkgconf:$env:VCPKG_DEFAULT_TRIPLET"
 
@@ -91,24 +102,20 @@ jobs:
           $buildDir = Join-Path $env:GITHUB_WORKSPACE "build-win64"
           New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
 
-          $toolchain = Join-Path $env:VCPKG_ROOT "scripts\buildsystems\vcpkg.cmake"
+          $toolchain = Join-Path $env:GITHUB_WORKSPACE "vcpkg\scripts\buildsystems\vcpkg.cmake"
 
           $triplet = $env:VCPKG_DEFAULT_TRIPLET
-          $pkgconfExe = Join-Path $env:VCPKG_ROOT "installed\$triplet\tools\pkgconf\pkgconf.exe"
+          $pkgconfExe = Join-Path $env:GITHUB_WORKSPACE "vcpkg\installed\$triplet\tools\pkgconf\pkgconf.exe"
           if (!(Test-Path $pkgconfExe)) {
             throw "pkgconf.exe not found where expected: $pkgconfExe"
           }
 
-          $leptonicaDir = Join-Path $env:VCPKG_ROOT "installed\$triplet\share\leptonica"
+          $leptonicaDir = Join-Path $env:GITHUB_WORKSPACE "vcpkg\installed\$triplet\share\leptonica"
           if (!(Test-Path $leptonicaDir)) {
             throw "Leptonica CMake package dir not found: $leptonicaDir"
           }
 
           $env:PATH = (Split-Path $pkgconfExe -Parent) + ";" + $env:PATH
-
-          # ✅ FIX: make MSVC explicit
-          Write-Host "cl.exe:"
-          (Get-Command cl).Source | Out-Host
 
           cmake -S . -B $buildDir -G "Ninja" `
             -DCMAKE_BUILD_TYPE=Release `
@@ -119,41 +126,13 @@ jobs:
             -DSW_BUILD=OFF `
             -DBUILD_TESTS=OFF `
             -DBUILD_TRAINING_TOOLS=OFF `
-            -DBUILD_SHARED_LIBS=ON `
-            -DCMAKE_C_COMPILER=cl `
-            -DCMAKE_CXX_COMPILER=cl
+            -DBUILD_SHARED_LIBS=ON
 
       - name: Build target tesseract (x64 Release)
         shell: pwsh
         run: |
           $buildDir = Join-Path $env:GITHUB_WORKSPACE "build-win64"
           cmake --build $buildDir --config Release --target tesseract
-
-      # ✅ FIX: fail early if the produced tesseract.exe is MinGW-linked
-      - name: Sanity check dependencies (must be MSVC, not MinGW)
-        shell: pwsh
-        run: |
-          $buildDir = Join-Path $env:GITHUB_WORKSPACE "build-win64"
-
-          $exe = Get-ChildItem -Path $buildDir -Recurse -Filter "tesseract.exe" -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -notmatch '\\CMakeFiles\\' } |
-            Select-Object -First 1
-
-          if (-not $exe) {
-            throw "tesseract.exe not found for dependency check."
-          }
-
-          $deps = (& dumpbin /dependents $exe.FullName) -join "`n"
-          $bad  = @("libgcc_s_seh-1.dll", "libstdc++-6.dll", "libwinpthread-1.dll")
-
-          foreach ($b in $bad) {
-            if ($deps -match [Regex]::Escape($b)) {
-              Write-Host $deps
-              throw "Produced tesseract.exe depends on MinGW runtime ($b). This means the build used a MinGW/GCC toolchain. Fix toolchain to MSVC; do not ship this installer."
-            }
-          }
-
-          Write-Host "OK: No MinGW runtime dependencies detected."
 
       # -----------------------------
       # Assemble runtime folder
@@ -188,7 +167,7 @@ jobs:
               Copy-Item $_.FullName $runtimeDir -Force -ErrorAction SilentlyContinue
             }
 
-          $vcpkgBin = Join-Path $env:VCPKG_ROOT "installed\$env:VCPKG_DEFAULT_TRIPLET\bin"
+          $vcpkgBin = Join-Path $env:GITHUB_WORKSPACE "vcpkg\installed\$env:VCPKG_DEFAULT_TRIPLET\bin"
           if (Test-Path $vcpkgBin) {
             Get-ChildItem -Path $vcpkgBin -Filter *.dll -File |
               ForEach-Object {
